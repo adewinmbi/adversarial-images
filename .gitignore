@@ -1,3 +1,9 @@
+# Experiment outputs
+*.out
+experiments/
+data/reasoning_benchmark/
+data/alpaca.json
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
