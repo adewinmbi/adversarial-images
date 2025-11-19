@@ -2,15 +2,15 @@ from typing import Optional
 import torch
 from torch import Tensor
 from PIL import Image
-from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
+from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 
 from .model import AbstractModel
 
 
-class Qwen3Instruct(AbstractModel):
-    """Qwen3-VL-8B-Instruct model wrapper."""
+class Qwen25Instruct(AbstractModel):
+    """Qwen2.5-VL-7B-Instruct model wrapper."""
     
-    MODEL_NAME = "Qwen/Qwen3-VL-8B-Instruct"
+    MODEL_NAME = "Qwen/Qwen2.5-VL-7B-Instruct"
     
     def __init__(self):
         super().__init__()
@@ -22,14 +22,14 @@ class Qwen3Instruct(AbstractModel):
         dtype: str = "auto",
         device_map: str = "auto",
         freeze_params: bool = True
-    ) -> "Qwen3Instruct":
-        """Load Qwen3-VL-8B-Instruct model and processor."""
+    ) -> "Qwen25Instruct":
+        """Load Qwen2.5-VL-7B-Instruct model and processor."""
         instance = cls()
         
         print(f"Loading {cls.MODEL_NAME}...", flush=True)
-        instance.model = Qwen3VLForConditionalGeneration.from_pretrained(
+        instance.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             cls.MODEL_NAME,
-            dtype=dtype,
+            torch_dtype=dtype,
             device_map=device_map,
             cache_dir=cache_dir
         )
@@ -39,7 +39,11 @@ class Qwen3Instruct(AbstractModel):
         )
         
         if freeze_params:
+            print("Freezing model parameters...", flush=True)
             instance.freeze_parameters()
+            print("Model loaded and frozen.", flush=True)
+        else:
+            print("Model loaded.", flush=True)
         
         return instance
     
@@ -134,3 +138,4 @@ class Qwen3Instruct(AbstractModel):
             )[0]
         
         return output_text
+

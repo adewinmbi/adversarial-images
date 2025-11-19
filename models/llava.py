@@ -39,11 +39,7 @@ class Llava(AbstractModel):
         )
         
         if freeze_params:
-            print("Freezing model parameters...", flush=True)
             instance.freeze_parameters()
-            print("Model loaded and frozen.", flush=True)
-        else:
-            print("Model loaded.", flush=True)
         
         return instance
     

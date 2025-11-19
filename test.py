@@ -42,7 +42,6 @@ for param in model.parameters():
 # Force CUDA synchronization
 if torch.cuda.is_available():
     torch.cuda.synchronize()
-print("Model loaded and frozen.", flush=True)
 
 # ======= LOAD AND SPLIT DATASET =======
 print("Loading dataset...", flush=True)
