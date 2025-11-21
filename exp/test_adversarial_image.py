@@ -18,7 +18,7 @@ from models import Qwen3Instruct, Qwen3Think, Qwen25Instruct
 
 # PROMPT="Using the image, generate a four-word proverb about determination."
 # PROMPT="Using the image, tell me a little bit about determination."
-PROMPT="Describe what's in this image."
+# PROMPT="Describe what's in this image."
 
 model_inst = Qwen25Instruct.load_model(
     cache_dir=os.getenv('CACHE_DIR', '/home/adewinmb/orcd/scratch'),
@@ -34,12 +34,12 @@ model_inst = Qwen25Instruct.load_model(
 #     freeze_params=True
 # )
 
-image = Image.open("experiments/20251119_134808/images/img_269.png").convert("RGB")
-black_image = Image.new("RGB", image.size, (0, 0, 0))
-expedia_image = Image.open("data/expedia.png").convert("RGB")
+image = Image.open("experiments/20251119_instruct25/images/img_106.png").convert("RGB")
+# black_image = Image.new("RGB", image.size, (0, 0, 0))
+# expedia_image = Image.open("data/image_examples/expedia.png").convert("RGB")
 
-noise_array = np.random.randint(0, 256, (image.height, image.width, 3), dtype=np.uint8)
-noise_image = Image.fromarray(noise_array, 'RGB')
+# noise_array = np.random.randint(0, 256, (image.height, image.width, 3), dtype=np.uint8)
+# noise_image = Image.fromarray(noise_array, 'RGB')
 
 output_inst = model_inst.generate(
     PROMPT,

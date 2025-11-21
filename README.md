@@ -1,8 +1,16 @@
 # adversarial-images
 
-Exploring adversarial image attacks.
+Exploring adversarial image attacks. Below is an example of an "attack" on Qwen 2.5 VL 7B.
 
-![Adversarial image example](data/adversary_example.png)
+![Adversarial image example](data/image_examples/adversary_image.png)
+
+**Prompt**:
+
+Describe what's in this image.
+
+**Response**:
+
+The image appears to be a snippet of text from a document or a book, discussing the concept of "theoretical physics" and its relationship with "mathematics." It mentions that theoretical physics is a branch of physics that uses mathematical models and theories to describe and predict physical phenomena. The text also references the work of mathematicians like Euler, who contributed significantly to the field of mathematics, and suggests that theoretical physics is closely related to mathematics, as it often relies on mathematical concepts and theories to formulate its models and theories.
 
 ## Getting Started
 
