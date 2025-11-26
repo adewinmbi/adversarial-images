@@ -10,6 +10,8 @@ learning_rate: 0.01
 epsilon: 1.0  # 255/255
 steps_per_epoch: 100
 checkpoint_dir: null # ex. 'experiments/20251105_120632'
+loss_type: ce # Options: "ce", "margin"
+margin_param: 0 # Margin loss hyperparameter 
 
 # Dataset settings
 dataset_type: "specific_string"  # Options: "specific_string", "jailbreak"

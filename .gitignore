@@ -1,3 +1,8 @@
+.vscode/
+scripts/*
+!scripts/alloc.sh
+!scripts/example.sbatch
+
 # Experiment outputs
 *.out
 experiments/

@@ -61,6 +61,14 @@ def main(
         None,
         help="Model to use: llava, qwen3inst, qwen3think, or qwen25inst (overrides config)"
     ),
+    loss_type: Optional[str] = typer.Option(
+        None,
+        help="Loss to use: 'ce' or 'margin' (overrides config)"
+    ),
+    margin_param: Optional[int] = typer.Option(
+        None,
+        help="m in margin loss: margin = max(0, m - (z_y - max_(j != y z_j)))"
+    ),
     initial_image: Optional[str] = typer.Option(
         None,
         help="Initial image type: black, noise, or expedia (overrides config)"
@@ -110,6 +118,10 @@ def main(
         cfg['initial_image'] = initial_image
     if target_str is not None:
         cfg['target_str'] = target_str
+    if loss_type is not None:
+        cfg['loss_type'] = loss_type
+    if margin_param is not None:
+        cfg['margin_param'] = margin_param
     if dataset_type is not None:
         cfg['dataset_type'] = dataset_type
     if log_dir is not None:
@@ -268,85 +280,55 @@ def main(
         img_for_processor = adv_image_tensor.permute(2, 0, 1)
         temp_pil = tensor_to_pil(adv_image_tensor)
         
-        # Handle different model types
-        if cfg['model_name'] == "llava":
-            # LLaVA-specific processing
-            # First get prompt length (without target)
-            prompt_only = f"USER: <image>\n{instruction}\nASSISTANT:"
-            prompt_inputs = model_wrapper.processor(
-                text=prompt_only,
-                images=temp_pil,
-                return_tensors="pt"
-            )
-            prompt_len = prompt_inputs.input_ids.shape[1]
-            
-            # Now create full input (prompt + target)
-            full_text = f"USER: <image>\n{instruction}\nASSISTANT: {label}"
-            inputs = model_wrapper.processor(
-                text=full_text,
-                images=temp_pil,
-                return_tensors="pt"
-            )
-            inputs = {k: v.to(model_wrapper.device) for k, v in inputs.items()}
-            
-            # Remove image_sizes if present (compatibility issue)
-            if 'image_sizes' in inputs:
-                del inputs['image_sizes']
-            
-            # Replace pixel_values with our differentiable tensor
-            if 'pixel_values' in inputs:
-                temp_inputs = model_wrapper.processor.image_processor(temp_pil, return_tensors="pt")
-                inputs['pixel_values'] = temp_inputs['pixel_values'].to(model_wrapper.device)
-        else:
-            # Qwen models use apply_chat_template
-            # First get prompt length (without target)
-            prompt_messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "image": temp_pil},
-                        {"type": "text", "text": instruction},
-                    ],
-                }
-            ]
-            prompt_inputs = model_wrapper.processor.apply_chat_template(
-                prompt_messages,
-                tokenize=True,
-                add_generation_prompt=True,
-                return_dict=True,
-                return_tensors="pt"
-            )
-            prompt_len = prompt_inputs.input_ids.shape[1]
-            
-            # Now create full input (prompt + target as assistant response)
-            full_messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "image": temp_pil},
-                        {"type": "text", "text": instruction},
-                    ],
-                },
-                {
-                    "role": "assistant",
-                    "content": [
-                        {"type": "text", "text": label},
-                    ],
-                }
-            ]
-            inputs = model_wrapper.processor.apply_chat_template(
-                full_messages,
-                tokenize=True,
-                add_generation_prompt=False,
-                return_dict=True,
-                return_tensors="pt"
-            )
-            inputs = inputs.to(model_wrapper.device)
-            
-            # Replace pixel_values with our differentiable tensor
-            if 'pixel_values' in inputs:
-                temp_inputs = model_wrapper.processor.image_processor(img_for_processor, return_tensors="pt")
-                inputs['pixel_values'] = temp_inputs['pixel_values'].to(model_wrapper.device)
+        # Qwen models use apply_chat_template
+        # First get prompt length (without target)
+        prompt_messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": temp_pil},
+                    {"type": "text", "text": instruction},
+                ],
+            }
+        ]
+        prompt_inputs = model_wrapper.processor.apply_chat_template(
+            prompt_messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="pt"
+        )
+        prompt_len = prompt_inputs.input_ids.shape[1]
+        
+        # Now create full input (prompt + target as assistant response)
+        full_messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": temp_pil},
+                    {"type": "text", "text": instruction},
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": label},
+                ],
+            }
+        ]
+        inputs = model_wrapper.processor.apply_chat_template(
+            full_messages,
+            tokenize=True,
+            add_generation_prompt=False,
+            return_dict=True,
+            return_tensors="pt"
+        )
+        inputs = inputs.to(model_wrapper.device)
+        
+        # Replace pixel_values with our differentiable tensor
+        if 'pixel_values' in inputs:
+            temp_inputs = model_wrapper.processor.image_processor(img_for_processor, return_tensors="pt")
+            inputs['pixel_values'] = temp_inputs['pixel_values'].to(model_wrapper.device)
         
         # Forward pass through the underlying model
         outputs = model_wrapper.model(**inputs, output_hidden_states=False)
@@ -359,7 +341,20 @@ def main(
         pred_logits_flat = pred_logits_for_target.reshape(-1, pred_logits_for_target.shape[-1])
         target_flat = target_token_ids.reshape(-1)
         
-        loss = F.cross_entropy(pred_logits_flat, target_flat)
+        if cfg['loss_type'] == 'ce':
+            loss = F.cross_entropy(pred_logits_flat, target_flat)
+        elif cfg['loss_type'] == 'margin':
+            # Margin loss: for each target token, margin = max(0, margin_param - (z_y - max_{j != y} z_j)), then mean over tokens
+            # pred_logits_flat: (N, vocab_size), target_flat: (N,)
+            z_y = pred_logits_flat.gather(1, target_flat.unsqueeze(1)).squeeze(1)  # (N,)
+
+            # Find runner up
+            pred_logits_no_target = pred_logits_flat.clone()
+            pred_logits_no_target[torch.arange(pred_logits_flat.shape[0]), target_flat] = float('-inf')
+            z_runnerup, _ = pred_logits_no_target.max(dim=1)  # (N,)
+            
+            losses = torch.clamp(cfg['margin_param'] - (z_y - z_runnerup), min=0)
+            loss = losses.mean()
         return loss
     
     def evaluate(instructions, labels, adv_image_tensor):
