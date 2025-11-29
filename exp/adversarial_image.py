@@ -94,6 +94,10 @@ def main(
         If null, starts training from `initial_image`. 
         Otherwise, resumes training from most recent 
         image in checkpoint_dir."""
+    ),
+    checkpoint_every: Optional[int] = typer.Option(
+        None,
+        help="Save adversarial image checkpoints every N epochs (default 10)."
     )
 ):
     """
@@ -130,6 +134,12 @@ def main(
         cfg['steps_per_epoch'] = steps_per_epoch
     if checkpoint_dir is not None:
         cfg['checkpoint_dir'] = checkpoint_dir
+    if checkpoint_every is not None:
+        cfg['checkpoint_every'] = checkpoint_every
+
+    cfg.setdefault('checkpoint_every', 10)
+    if cfg['checkpoint_every'] <= 0:
+        raise ValueError("checkpoint_every must be a positive integer.")
     
     # Generate log directory if not specified
     if cfg['log_dir'] is None:
@@ -277,7 +287,7 @@ def main(
         target_len = target_token_ids.shape[1]
         
         # Convert tensor to PIL for the model
-        img_for_processor = adv_image_tensor.permute(2, 0, 1)
+        img_for_processor = adv_image_tensor.permute(2, 0, 1) # After permute shape: [H W C]
         temp_pil = tensor_to_pil(adv_image_tensor)
         
         # Qwen models use apply_chat_template
@@ -426,9 +436,10 @@ def main(
         
         print(f"  Epoch {epoch + 1} - Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}", flush=True)
         
-        # Save adversarial image for this epoch
-        epoch_adv_pil = tensor_to_pil(adv_image_tensor)
-        epoch_adv_pil.save(os.path.join(cfg['log_dir'], "images", f"img_{epoch + 1}.png"))
+        # Save adversarial image for this epoch according to checkpoint cadence
+        if (epoch + 1) % cfg['checkpoint_every'] == 0:
+            epoch_adv_pil = tensor_to_pil(adv_image_tensor)
+            epoch_adv_pil.save(os.path.join(cfg['log_dir'], "images", f"img_{epoch + 1}.png"))
         
         def extend_losses(x):
             """Adjust length of train/val list to accomodate for missing loss.csv from checkpoint"""

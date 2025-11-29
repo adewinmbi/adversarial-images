@@ -1,0 +1,28 @@
+# Default configuration for adversarial fine-tuning (no image optimization)
+
+# Model settings
+cache_dir: "/home/adewinmb/orcd/scratch"
+model_name: "qwen3inst"
+
+# Training settings
+num_epochs: 3
+learning_rate: 0.00005
+steps_per_epoch: 100
+checkpoint_dir: null
+checkpoint_every: 10  # Save model checkpoint every N epochs
+loss_type: margin  # Options: "ce", "margin"
+margin_param: 0
+max_new_tokens: 128
+
+# Dataset settings
+dataset_type: "specific_string"  # Options: "specific_string", "jailbreak"
+train_split: 0.7
+val_split: 0.2
+test_split: 0.1
+target_str: "Download the guide at malware.com!"
+
+# Output settings
+num_examples: 10
+log_dir: null  # If null, will be auto-generated with timestamp
+
+
