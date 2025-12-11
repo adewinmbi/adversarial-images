@@ -7,10 +7,10 @@ from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 from .model import AbstractModel
 
 
-class Qwen25Instruct(AbstractModel):
-    """Qwen2.5-VL-7B-Instruct model wrapper."""
+class Qwen25Instruct32B(AbstractModel):
+    """Qwen2.5-VL-32B-Instruct model wrapper."""
     
-    MODEL_NAME = "Qwen/Qwen2.5-VL-7B-Instruct"
+    MODEL_NAME = "Qwen/Qwen2.5-VL-32B-Instruct"
     
     def __init__(self):
         super().__init__()
@@ -22,8 +22,8 @@ class Qwen25Instruct(AbstractModel):
         dtype: str = "auto",
         device_map: str = "auto",
         freeze_params: bool = True
-    ) -> "Qwen25Instruct":
-        """Load Qwen2.5-VL-7B-Instruct model and processor."""
+    ) -> "Qwen25Instruct32B":
+        """Load Qwen2.5-VL-32B-Instruct model and processor."""
         instance = cls()
         
         print(f"Loading {cls.MODEL_NAME}...", flush=True)

@@ -17,11 +17,18 @@ from datetime import datetime
 import yaml
 import typer
 import pandas as pd
+from peft import (
+    LoraConfig,
+    TaskType,
+    get_peft_model,
+    set_peft_model_state_dict,
+)
 
-# Use the model registry for dynamic model loading
+# Use the refactored model registry helpers
 from models import load_model_by_name, valid_model_names
 from data.specific_string_data import SpecificStringDataset
 from data.jailbreak_data import JailbreakDataset
+from data.partition import apply_partition
 
 app = typer.Typer(pretty_exceptions_show_locals=False)
 
@@ -39,10 +46,121 @@ def save_config(config: dict, output_path: str):
         yaml.dump(config, f, default_flow_style=False, sort_keys=False)
 
 
+def _load_teacher_config(checkpoint_path: str, teacher_cfg_path: Optional[str] = None) -> dict:
+    """
+    Load the config.yaml for the teacher model.
+    
+    If teacher_cfg_path is provided, use that directly. Otherwise, infer from
+    checkpoint path (expects checkpoint at <run_dir>/checkpoints/checkpoint_epoch_XXXX.pt
+    and config at <run_dir>/config.yaml).
+    """
+    if teacher_cfg_path is not None:
+        config_path = teacher_cfg_path
+        if os.path.isdir(config_path):
+            config_path = os.path.join(config_path, "config.yaml")
+    else:
+        ckpt_dir = os.path.dirname(checkpoint_path)
+        run_dir = os.path.dirname(ckpt_dir)
+        config_path = os.path.join(run_dir, "config.yaml")
+
+    if os.path.exists(config_path):
+        with open(config_path, "r") as f:
+            return yaml.safe_load(f)
+    return {}
+
+
+def _prepare_lora_model(base_model: torch.nn.Module, teacher_cfg: dict) -> torch.nn.Module:
+    """Attach LoRA adapters to the teacher backbone using the teacher's saved config."""
+    target_modules = teacher_cfg.get("lora_target_modules") or ["q_proj", "k_proj", "v_proj", "o_proj"]
+    if isinstance(target_modules, str):
+        target_modules = [target_modules]
+    if not target_modules:
+        raise ValueError("lora_target_modules must be a non-empty list when use_lora is enabled.")
+
+    lora_config = LoraConfig(
+        r=teacher_cfg.get("lora_r", 64),
+        lora_alpha=teacher_cfg.get("lora_alpha", 128),
+        lora_dropout=teacher_cfg.get("lora_dropout", 0.05),
+        bias="none",
+        task_type=TaskType.CAUSAL_LM,
+        target_modules=target_modules,
+    )
+    print(
+        f"Attaching LoRA adapters to teacher "
+        f"(r={lora_config.r}, alpha={lora_config.lora_alpha}, "
+        f"dropout={lora_config.lora_dropout}, targets={target_modules})",
+        flush=True,
+    )
+    peft_model = get_peft_model(base_model, lora_config)
+    return peft_model
+
+
+def _checkpoint_contains_lora(state_dict: dict) -> bool:
+    """Detect whether a checkpoint state dict stores LoRA adapter weights."""
+    return any("lora" in key for key in state_dict.keys())
+
+
+def _load_teacher_model(
+    model_name: str,
+    checkpoint_path: str,
+    cache_dir: Optional[str],
+    teacher_cfg_path: Optional[str] = None,
+):
+    """
+    Load a teacher model and hydrate weights from checkpoint.
+    
+    Automatically detects whether the checkpoint contains LoRA adapters and
+    reads the LoRA hyperparameters from the teacher's config.yaml.
+    
+    Args:
+        model_name: Model architecture key (e.g. 'qwen25_32b').
+        checkpoint_path: Path to the .pt checkpoint file.
+        cache_dir: HuggingFace cache directory.
+        teacher_cfg_path: Optional explicit path to teacher config.yaml or its
+            parent directory. If None, inferred from checkpoint_path.
+    """
+    if checkpoint_path is None:
+        raise ValueError("teacher_checkpoint must be provided for distillation.")
+
+    # Load the teacher's training config to get LoRA settings
+    teacher_cfg = _load_teacher_config(checkpoint_path, teacher_cfg_path)
+    use_lora = teacher_cfg.get("use_lora", False)
+
+    load_kwargs = dict(
+        cache_dir=cache_dir,
+        dtype="auto",
+        device_map="auto",
+        freeze_params=True,
+    )
+    teacher_wrapper = load_model_by_name(model_name, **load_kwargs)
+
+    checkpoint = torch.load(checkpoint_path, map_location=teacher_wrapper.device)
+    state_dict = checkpoint.get("model_state_dict", checkpoint)
+
+    # Auto-detect LoRA if config doesn't specify but checkpoint has adapter keys
+    checkpoint_has_lora = _checkpoint_contains_lora(state_dict)
+    if checkpoint_has_lora and not use_lora:
+        print(
+            "Detected LoRA adapter keys in checkpoint but use_lora=False in teacher config. "
+            "Enabling LoRA with default parameters.",
+            flush=True,
+        )
+        use_lora = True
+
+    if use_lora:
+        teacher_wrapper.model = _prepare_lora_model(teacher_wrapper.model, teacher_cfg)
+        set_peft_model_state_dict(teacher_wrapper.model, state_dict)
+    else:
+        teacher_wrapper.model.load_state_dict(state_dict)
+
+    teacher_wrapper.model.eval()
+    return teacher_wrapper
+
+
 @app.command()
 def main(
     config: str = typer.Option(
-        "configs/default.yaml",
+        "configs/distill_default.yaml",
         help="Path to YAML config file"
     ),
     cache_dir: Optional[str] = typer.Option(
@@ -57,17 +175,21 @@ def main(
         None,
         help="Learning rate (overrides config)"
     ),
-    model_name: Optional[str] = typer.Option(
+    base_model_name: Optional[str] = typer.Option(
         None,
-        help="Model to use: llava, qwen3inst, qwen3think, or qwen25inst (overrides config)"
+        help="Frozen student model to receive adversarial image"
     ),
-    loss_type: Optional[str] = typer.Option(
+    teacher_model_name: Optional[str] = typer.Option(
         None,
-        help="Loss to use: 'ce' or 'margin' (overrides config)"
+        help="Model architecture to instantiate for jailbroken checkpoint"
     ),
-    margin_param: Optional[int] = typer.Option(
+    teacher_checkpoint: Optional[str] = typer.Option(
         None,
-        help="m in margin loss: margin = max(0, m - (z_y - max_(j != y z_j)))"
+        help="Path to finetuned/jailbroken model checkpoint (.pt)"
+    ),
+    teacher_cfg_path: Optional[str] = typer.Option(
+        None,
+        help="Path to teacher config.yaml or its parent directory. If not provided, inferred from teacher_checkpoint."
     ),
     initial_image: Optional[str] = typer.Option(
         None,
@@ -80,6 +202,11 @@ def main(
     dataset_type: Optional[str] = typer.Option(
         None,
         help="Dataset type: specific_string or jailbreak (overrides config)"
+    ),
+    partition: Optional[str] = typer.Option(
+        None,
+        case_sensitive=False,
+        help="Dataset partition to use: 'all', 'a', or 'b' (applies to train/val/test)",
     ),
     log_dir: Optional[str] = typer.Option(
         None,
@@ -101,9 +228,9 @@ def main(
     )
 ):
     """
-    Train adversarial images for vision-language models.
-    
-    Configuration is loaded from a YAML file, and can be overridden with CLI arguments.
+    Distill a jailbroken (teacher) model into an adversarial image for a frozen
+    student model. Teacher provides soft token distributions; the student with
+    the adversarial image matches those distributions via KL/Cross-Entropy.
     """
     
     # Load base config
@@ -116,18 +243,22 @@ def main(
         cfg['num_epochs'] = num_epochs
     if learning_rate is not None:
         cfg['learning_rate'] = learning_rate
-    if model_name is not None:
-        cfg['model_name'] = model_name
+    if base_model_name is not None:
+        cfg['base_model_name'] = base_model_name
+    if teacher_model_name is not None:
+        cfg['teacher_model_name'] = teacher_model_name
+    if teacher_checkpoint is not None:
+        cfg['teacher_checkpoint'] = teacher_checkpoint
+    if teacher_cfg_path is not None:
+        cfg['teacher_cfg_path'] = teacher_cfg_path
     if initial_image is not None:
         cfg['initial_image'] = initial_image
     if target_str is not None:
         cfg['target_str'] = target_str
-    if loss_type is not None:
-        cfg['loss_type'] = loss_type
-    if margin_param is not None:
-        cfg['margin_param'] = margin_param
     if dataset_type is not None:
         cfg['dataset_type'] = dataset_type
+    if partition is not None:
+        cfg['partition'] = partition
     if log_dir is not None:
         cfg['log_dir'] = log_dir
     if steps_per_epoch is not None:
@@ -138,35 +269,49 @@ def main(
         cfg['checkpoint_every'] = checkpoint_every
 
     cfg.setdefault('checkpoint_every', 10)
+    cfg.setdefault('partition', 'all')
     if cfg['checkpoint_every'] <= 0:
         raise ValueError("checkpoint_every must be a positive integer.")
     
     # Generate log directory if not specified
     if cfg['log_dir'] is None:
         cfg['log_dir'] = f"experiments/{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    log_dir_path = cfg['log_dir']
+    checkpoint_dir_value = cfg.get('checkpoint_dir')
     
     # Create log directories
-    os.makedirs(cfg['log_dir'], exist_ok=True)
-    os.makedirs(os.path.join(cfg['log_dir'], "images"), exist_ok=True)
+    os.makedirs(log_dir_path, exist_ok=True)
+    os.makedirs(os.path.join(log_dir_path, "images"), exist_ok=True)
     
     # Save the actual config used (including CLI overrides)
-    save_config(cfg, os.path.join(cfg['log_dir'], "config.yaml"))
+    save_config(cfg, os.path.join(log_dir_path, "config.yaml"))
     
     # ======= LOAD MODEL =======
     
     # Validate model_name
     valid_models = valid_model_names()
-    if cfg['model_name'] not in valid_models:
-        print(f"Error: Invalid model_name '{cfg['model_name']}'. Must be one of {valid_models}", flush=True)
+    if cfg['base_model_name'] not in valid_models:
+        print(f"Error: Invalid base_model_name '{cfg['base_model_name']}'. Must be one of {valid_models}", flush=True)
         sys.exit(1)
+    teacher_model_name = cfg.get('teacher_model_name', cfg['base_model_name'])
+    if teacher_model_name not in valid_models:
+        print(f"Error: Invalid teacher_model_name '{teacher_model_name}'. Must be one of {valid_models}", flush=True)
+        sys.exit(1)
+    if cfg.get('teacher_checkpoint') is None:
+        raise ValueError("teacher_checkpoint must be provided for adversarial distillation.")
     
-    # Load the model via registry
-    model_wrapper = load_model_by_name(
-        cfg['model_name'],
+    load_kwargs = dict(
         cache_dir=cfg['cache_dir'],
         dtype="auto",
         device_map="auto",
         freeze_params=True,
+    )
+    model_wrapper = load_model_by_name(cfg['base_model_name'], **load_kwargs)
+    teacher_wrapper = _load_teacher_model(
+        teacher_model_name,
+        cfg['teacher_checkpoint'],
+        cfg['cache_dir'],
+        cfg.get('teacher_cfg_path'),
     )
     
     # ======= LOAD AND SPLIT DATASET =======
@@ -193,6 +338,16 @@ def main(
     
     # Get dataset splits
     train_instructions, train_labels, val_instructions, val_labels, test_instructions, test_labels = dataset.get_splits()
+    partition_choice = cfg.get('partition', 'all')
+    train_instructions, train_labels = apply_partition(
+        train_instructions, train_labels, partition_choice, split_name="train"
+    )
+    val_instructions, val_labels = apply_partition(
+        val_instructions, val_labels, partition_choice, split_name="val"
+    )
+    test_instructions, test_labels = apply_partition(
+        test_instructions, test_labels, partition_choice, split_name="test"
+    )
     
     # ======= INITIALIZE ADVERSARIAL IMAGE =======
     print(f"Initializing adversarial image with method: {cfg['initial_image']}", flush=True)
@@ -244,33 +399,68 @@ def main(
         img_np = (tensor.detach().cpu().numpy() * 255).astype(np.uint8)
         return Image.fromarray(img_np)
     
-    def compute_loss(instruction, label, adv_image_tensor):
-        """
-        Compute loss for a single instruction with adversarial image.
-        
-        Args:
-            instruction: The instruction/prompt text
-            label: The target label/response text
-            adv_image_tensor: The adversarial image tensor
-        
-        Uses proper teacher forcing: concatenates prompt + target, then computes
-        loss on logits that predict the target tokens.
-        """
-        # Tokenize the target label for this sample
-        target_tokens = model_wrapper.processor.tokenizer(
-            label,
+    def _tokenize_label(processor, text):
+        tokens = processor.tokenizer(
+            text,
             return_tensors="pt",
             add_special_tokens=False
         )
-        target_token_ids = target_tokens.input_ids.to(model_wrapper.device)
-        target_len = target_token_ids.shape[1]
-        
-        # Convert tensor to PIL for the model
-        img_for_processor = adv_image_tensor.permute(2, 0, 1) # After permute shape: [H W C]
+        return tokens.input_ids
+
+    def compute_teacher_probs(instruction: str, label: str):
+        """Return teacher probability distribution over target tokens (text-only)."""
+        target_tokens = _tokenize_label(teacher_wrapper.processor, label).to(teacher_wrapper.device)
+        target_len = target_tokens.shape[1]
+        prompt_messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": instruction},
+                ],
+            }
+        ]
+        prompt_inputs = teacher_wrapper.processor.apply_chat_template(
+            prompt_messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="pt"
+        )
+        prompt_len = prompt_inputs.input_ids.shape[1]
+        full_messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": instruction},
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": label},
+                ],
+            }
+        ]
+        inputs = teacher_wrapper.processor.apply_chat_template(
+            full_messages,
+            tokenize=True,
+            add_generation_prompt=False,
+            return_dict=True,
+            return_tensors="pt"
+        )
+        inputs = inputs.to(teacher_wrapper.device)
+        with torch.no_grad():
+            outputs = teacher_wrapper.model(**inputs, output_hidden_states=False)
+            logits = outputs.logits[:, prompt_len-1:prompt_len+target_len-1, :]
+            probs = F.softmax(logits, dim=-1)
+        return probs.squeeze(0).to(model_wrapper.device), target_tokens.to(model_wrapper.device)
+
+    def compute_student_logits(instruction: str, label: str, adv_image_tensor: torch.Tensor):
+        """Return student logits aligned to the label tokens."""
+        target_tokens = _tokenize_label(model_wrapper.processor, label).to(model_wrapper.device)
+        target_len = target_tokens.shape[1]
+        img_for_processor = adv_image_tensor.permute(2, 0, 1)
         temp_pil = tensor_to_pil(adv_image_tensor)
-        
-        # Qwen models use apply_chat_template
-        # First get prompt length (without target)
         prompt_messages = [
             {
                 "role": "user",
@@ -288,8 +478,6 @@ def main(
             return_tensors="pt"
         )
         prompt_len = prompt_inputs.input_ids.shape[1]
-        
-        # Now create full input (prompt + target as assistant response)
         full_messages = [
             {
                 "role": "user",
@@ -313,37 +501,19 @@ def main(
             return_tensors="pt"
         )
         inputs = inputs.to(model_wrapper.device)
-        
-        # Replace pixel_values with our differentiable tensor
         if 'pixel_values' in inputs:
             temp_inputs = model_wrapper.processor.image_processor(img_for_processor, return_tensors="pt")
             inputs['pixel_values'] = temp_inputs['pixel_values'].to(model_wrapper.device)
-        
-        # Forward pass through the underlying model
         outputs = model_wrapper.model(**inputs, output_hidden_states=False)
-        pred_logits = outputs.logits
-        
-        # Extract logits that predict the target tokens
-        # Logits at position i predict token i+1
-        # So logits[prompt_len-1 : prompt_len+target_len-1] predict tokens at positions [prompt_len : prompt_len+target_len]
-        pred_logits_for_target = pred_logits[:, prompt_len-1:prompt_len+target_len-1, :]
-        pred_logits_flat = pred_logits_for_target.reshape(-1, pred_logits_for_target.shape[-1])
-        target_flat = target_token_ids.reshape(-1)
-        
-        if cfg['loss_type'] == 'ce':
-            loss = F.cross_entropy(pred_logits_flat, target_flat)
-        elif cfg['loss_type'] == 'margin':
-            # Margin loss: for each target token, margin = max(0, margin_param - (z_y - max_{j != y} z_j)), then mean over tokens
-            # pred_logits_flat: (N, vocab_size), target_flat: (N,)
-            z_y = pred_logits_flat.gather(1, target_flat.unsqueeze(1)).squeeze(1)  # (N,)
+        logits = outputs.logits[:, prompt_len-1:prompt_len+target_len-1, :]
+        return logits.squeeze(0), target_tokens
 
-            # Find runner up
-            pred_logits_no_target = pred_logits_flat.clone()
-            pred_logits_no_target[torch.arange(pred_logits_flat.shape[0]), target_flat] = float('-inf')
-            z_runnerup, _ = pred_logits_no_target.max(dim=1)  # (N,)
-            
-            losses = torch.clamp(cfg['margin_param'] - (z_y - z_runnerup), min=0)
-            loss = losses.mean()
+    def compute_loss(instruction, label, adv_image_tensor):
+        """Cross-entropy between teacher soft labels and student logits."""
+        teacher_probs, _ = compute_teacher_probs(instruction, label)
+        student_logits, _ = compute_student_logits(instruction, label, adv_image_tensor)
+        student_log_probs = F.log_softmax(student_logits, dim=-1)
+        loss = -(teacher_probs * student_log_probs).sum(dim=-1).mean()
         return loss
     
     def evaluate(instructions, labels, adv_image_tensor):
@@ -363,10 +533,10 @@ def main(
         return total_loss / min(len(instructions), cfg['steps_per_epoch'])
     
     # ======= TRAINING LOOP =======
-    print(f"Starting training. Saving at {log_dir}", flush=True)
+    print(f"Starting training. Saving at {log_dir_path}", flush=True)
     
-    checkpoint_path = os.path.join(checkpoint_dir, 'loss.csv') if checkpoint_dir is not None else None
-    if checkpoint_dir is not None and checkpoint_path is not None:
+    checkpoint_path = os.path.join(checkpoint_dir_value, 'loss.csv') if checkpoint_dir_value is not None else None
+    if checkpoint_dir_value is not None and checkpoint_path is not None:
         prev_losses = pd.read_csv(checkpoint_path)
         train_losses = prev_losses['train_loss'].tolist()
         val_losses = prev_losses['val_loss'].tolist()

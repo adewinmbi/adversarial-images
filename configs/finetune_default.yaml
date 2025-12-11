@@ -13,12 +13,22 @@ checkpoint_every: 10  # Save model checkpoint every N epochs
 loss_type: margin  # Options: "ce", "margin"
 margin_param: 0
 max_new_tokens: 128
+use_lora: false
+lora_r: 64
+lora_alpha: 128
+lora_dropout: 0.05
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
 
 # Dataset settings
 dataset_type: "specific_string"  # Options: "specific_string", "jailbreak"
 train_split: 0.7
 val_split: 0.2
 test_split: 0.1
+partition: "all"  # Options: "all", "a", "b"
 target_str: "Download the guide at malware.com!"
 
 # Output settings

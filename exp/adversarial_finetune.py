@@ -9,15 +9,23 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
+from peft import (
+    LoraConfig,
+    TaskType,
+    get_peft_model,
+    get_peft_model_state_dict,
+    set_peft_model_state_dict,
+)
 import typer
 import yaml
 
 # Add parent directory to Python path so we can import models
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from models import Qwen3Instruct, Qwen3Think, Qwen25Instruct, Llava
+from models import load_model_by_name, valid_model_names
 from data.specific_string_data import SpecificStringDataset
 from data.jailbreak_data import JailbreakDataset
+from data.partition import apply_partition
 
 app = typer.Typer(pretty_exceptions_show_locals=False)
 
@@ -43,6 +51,36 @@ def limit_steps(num_examples: int, steps_per_epoch: Optional[int]) -> int:
     return min(num_examples, steps_per_epoch)
 
 
+def prepare_lora_model(base_model: torch.nn.Module, cfg: dict) -> torch.nn.Module:
+    """Wrap the base model with LoRA adapters based on the provided config."""
+    
+    target_modules = cfg.get("lora_target_modules") or ["q_proj", "k_proj", "v_proj", "o_proj"]
+    if isinstance(target_modules, str):
+        target_modules = [target_modules]
+    if not isinstance(target_modules, list) or not target_modules:
+        raise ValueError("lora_target_modules must be a non-empty list of module names.")
+
+    lora_config = LoraConfig(
+        r=cfg["lora_r"],
+        lora_alpha=cfg["lora_alpha"],
+        lora_dropout=cfg["lora_dropout"],
+        bias="none",
+        task_type=TaskType.CAUSAL_LM,
+        target_modules=target_modules,
+    )
+
+    print(
+        "Enabling LoRA adapters "
+        f"(r={cfg['lora_r']}, alpha={cfg['lora_alpha']}, dropout={cfg['lora_dropout']}, "
+        f"targets={target_modules})",
+        flush=True,
+    )
+    peft_model = get_peft_model(base_model, lora_config)
+    if hasattr(peft_model, "print_trainable_parameters"):
+        peft_model.print_trainable_parameters()
+    return peft_model
+
+
 @app.command()
 def main(
     config: str = typer.Option(
@@ -63,7 +101,7 @@ def main(
     ),
     model_name: Optional[str] = typer.Option(
         None,
-        help="Model to fine-tune: llava, qwen3inst, qwen3think, qwen25inst"
+        help="Model to fine-tune: llava, qwen3inst, qwen3think, qwen25inst, qwen25_32b"
     ),
     loss_type: Optional[str] = typer.Option(
         None,
@@ -81,6 +119,11 @@ def main(
         None,
         help="Dataset type: specific_string or jailbreak"
     ),
+    partition: Optional[str] = typer.Option(
+        None,
+        case_sensitive=False,
+        help="Dataset partition to use: 'all', 'a', or 'b' (applies to train/val/test)",
+    ),
     log_dir: Optional[str] = typer.Option(
         None,
         help="Directory to store logs/checkpoints"
@@ -96,6 +139,26 @@ def main(
     checkpoint_every: Optional[int] = typer.Option(
         None,
         help="Save model checkpoint every N epochs"
+    ),
+    use_lora: Optional[bool] = typer.Option(
+        None,
+        help="Enable LoRA adapters for parameter-efficient fine-tuning (requires 'peft').",
+    ),
+    lora_r: Optional[int] = typer.Option(
+        None,
+        help="LoRA rank (only used when use_lora is enabled).",
+    ),
+    lora_alpha: Optional[int] = typer.Option(
+        None,
+        help="LoRA alpha scaling factor (only used when use_lora is enabled).",
+    ),
+    lora_dropout: Optional[float] = typer.Option(
+        None,
+        help="LoRA dropout probability (only used when use_lora is enabled).",
+    ),
+    lora_target_modules: Optional[str] = typer.Option(
+        None,
+        help="Comma-separated list of module names to target with LoRA adapters.",
     ),
 ):
     """
@@ -125,6 +188,8 @@ def main(
         cfg["margin_param"] = margin_param
     if dataset_type is not None:
         cfg["dataset_type"] = dataset_type
+    if partition is not None:
+        cfg["partition"] = partition
     if log_dir is not None:
         cfg["log_dir"] = log_dir
     if steps_per_epoch is not None:
@@ -133,9 +198,29 @@ def main(
         cfg["checkpoint_dir"] = checkpoint_dir
     if checkpoint_every is not None:
         cfg["checkpoint_every"] = checkpoint_every
+    if use_lora is not None:
+        cfg["use_lora"] = use_lora
+    if lora_r is not None:
+        cfg["lora_r"] = lora_r
+    if lora_alpha is not None:
+        cfg["lora_alpha"] = lora_alpha
+    if lora_dropout is not None:
+        cfg["lora_dropout"] = lora_dropout
+    if lora_target_modules is not None:
+        cfg["lora_target_modules"] = [
+            module.strip()
+            for module in lora_target_modules.split(",")
+            if module.strip()
+        ]
 
     cfg.setdefault("checkpoint_every", 1)
     cfg.setdefault("max_new_tokens", 128)
+    cfg.setdefault("partition", "all")
+    cfg.setdefault("use_lora", False)
+    cfg.setdefault("lora_r", 64)
+    cfg.setdefault("lora_alpha", 128)
+    cfg.setdefault("lora_dropout", 0.05)
+    cfg.setdefault("lora_target_modules", ["q_proj", "k_proj", "v_proj", "o_proj"])
 
     if cfg["checkpoint_every"] <= 0:
         raise ValueError("checkpoint_every must be a positive integer.")
@@ -148,14 +233,16 @@ def main(
             cfg["log_dir"] = f"experiments/{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
     os.makedirs(cfg["log_dir"], exist_ok=True)
-    checkpoints_path = os.path.join(cfg["log_dir"], "checkpoints")
+    
+    save_checkpoint_dir = cfg["checkpoint_dir"] if cfg["checkpoint_dir"] is not None else cfg["log_dir"]
+    checkpoints_path = os.path.join(save_checkpoint_dir, "checkpoints")
     os.makedirs(checkpoints_path, exist_ok=True)
 
     # Persist final config for reproducibility
     save_config(cfg, os.path.join(cfg["log_dir"], "config.yaml"))
 
     # ======= LOAD MODEL =======
-    valid_models = ["llava", "qwen3inst", "qwen3think", "qwen25inst"]
+    valid_models = valid_model_names()
     if cfg["model_name"] not in valid_models:
         print(
             f"Error: Invalid model_name '{cfg['model_name']}'. Must be one of {valid_models}",
@@ -164,14 +251,10 @@ def main(
         sys.exit(1)
 
     load_kwargs = dict(cache_dir=cfg["cache_dir"], dtype="auto", device_map="auto", freeze_params=False)
-    if cfg["model_name"] == "llava":
-        model_wrapper = Llava.load_model(**load_kwargs)
-    elif cfg["model_name"] == "qwen3inst":
-        model_wrapper = Qwen3Instruct.load_model(**load_kwargs)
-    elif cfg["model_name"] == "qwen3think":
-        model_wrapper = Qwen3Think.load_model(**load_kwargs)
-    else:
-        model_wrapper = Qwen25Instruct.load_model(**load_kwargs)
+    model_wrapper = load_model_by_name(cfg["model_name"], **load_kwargs)
+
+    if cfg["use_lora"]:
+        model_wrapper.model = prepare_lora_model(model_wrapper.model, cfg)
 
     model_wrapper.model.train()
 
@@ -207,6 +290,17 @@ def main(
         test_labels,
     ) = dataset.get_splits()
 
+    partition_choice = cfg.get("partition", "all")
+    train_instructions, train_labels = apply_partition(
+        train_instructions, train_labels, partition_choice, split_name="train"
+    )
+    val_instructions, val_labels = apply_partition(
+        val_instructions, val_labels, partition_choice, split_name="val"
+    )
+    test_instructions, test_labels = apply_partition(
+        test_instructions, test_labels, partition_choice, split_name="test"
+    )
+
     effective_train_steps = limit_steps(len(train_instructions), cfg["steps_per_epoch"])
     effective_val_steps = limit_steps(len(val_instructions), cfg["steps_per_epoch"])
 
@@ -234,7 +328,11 @@ def main(
         ckpt_path = os.path.join(ckpt_dir, fname)
         print(f"Loading checkpoint: {ckpt_path}", flush=True)
         checkpoint = torch.load(ckpt_path, map_location=model_wrapper.device)
-        model_wrapper.model.load_state_dict(checkpoint["model_state_dict"])
+        model_state = checkpoint["model_state_dict"]
+        if cfg["use_lora"]:
+            set_peft_model_state_dict(model_wrapper.model, model_state)
+        else:
+            model_wrapper.model.load_state_dict(model_state)
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         for state in optimizer.state.values():
             for k, v in state.items():
@@ -336,9 +434,14 @@ def main(
 
     def save_checkpoint(epoch_idx: int):
         """Persist model/optimizer state for resuming later."""
+        if cfg["use_lora"]:
+            model_state = get_peft_model_state_dict(model_wrapper.model)
+        else:
+            model_state = model_wrapper.model.state_dict()
+
         ckpt = {
             "epoch": epoch_idx,
-            "model_state_dict": model_wrapper.model.state_dict(),
+            "model_state_dict": model_state,
             "optimizer_state_dict": optimizer.state_dict(),
             "train_losses": train_losses,
             "val_losses": val_losses,

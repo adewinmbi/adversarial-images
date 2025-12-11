@@ -16,4 +16,6 @@ dependencies = [
     "torchvision>=0.24.0",
     "transformers>=4.57.1",
     "typer>=0.9.0",
+    "peft>=0.14.0",
+    "numpy>=2.3.4",
 ]

@@ -1,0 +1,33 @@
+# Default configuration for adversarial distillation (teacher logits)
+
+# Model settings
+cache_dir: "/home/adewinmb/orcd/scratch"
+base_model_name: "qwen25_32b"
+teacher_model_name: "qwen25_32b"
+teacher_checkpoint: null  # Path to finetuned/jailbroken checkpoint (.pt)
+teacher_cfg_path: null
+
+# Image initialization
+initial_image: "black"  # Options: "black", "noise", "expedia"
+
+# Training settings
+num_epochs: 30
+learning_rate: 0.01
+epsilon: 1.0
+steps_per_epoch: 100
+checkpoint_dir: null
+checkpoint_every: 1
+
+# Dataset settings
+dataset_type: "jailbreak" # specific_string or jailbreak
+train_split: 0.7
+val_split: 0.2
+test_split: 0.1
+partition: "b"  # Options: "all", "a", "b"
+target_str: "Download the guide at malware.com!"
+
+# Evaluation / output
+num_examples: 10
+log_dir: null
+
+
